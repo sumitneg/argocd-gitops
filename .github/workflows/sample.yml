@@ -1,0 +1,273 @@
+name: ArgoCD GitOps CI/CD Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+env:
+  ARGOCD_VERSION: v2.9.3
+
+jobs:
+  # Job 1: Validate YAML Files
+  validate-yaml:
+    name: Validate YAML Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install yamllint
+        run: |
+          pip install yamllint
+
+      - name: Validate YAML files
+        run: |
+          echo "🔍 Validating YAML files..."
+          yamllint -d '{extends: default, rules: {line-length: {max: 120}, indentation: {spaces: 2}}}' .
+          echo "✅ YAML validation passed!"
+
+  # Job 2: Security Scan
+  security-scan:
+    name: Security & Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+
+  # Job 3: ArgoCD Application Validation
+  argocd-validate:
+    name: Validate ArgoCD Applications
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/download/${{ env.ARGOCD_VERSION }}/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Validate ArgoCD application manifests
+        run: |
+          echo "🔍 Validating ArgoCD application manifests..."
+          
+          # Find all YAML files in environments
+          for file in $(find environments/ -name "*.yaml" -o -name "*.yml"); do
+            echo "Validating: $file"
+            
+            # Check if file contains ArgoCD Application spec
+            if grep -q "kind: Application" "$file"; then
+              # Basic validation of required fields
+              if ! grep -q "apiVersion:" "$file"; then
+                echo "❌ Missing apiVersion in $file"
+                exit 1
+              fi
+              if ! grep -q "metadata:" "$file"; then
+                echo "❌ Missing metadata in $file"
+                exit 1
+              fi
+              if ! grep -q "spec:" "$file"; then
+                echo "❌ Missing spec in $file"
+                exit 1
+              fi
+              echo "✅ $file is valid"
+            fi
+          done
+          
+          echo "✅ All ArgoCD applications validated!"
+
+  # Job 4: Deployment Dry Run (PR only)
+  deployment-dry-run:
+    name: Deployment Dry Run
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: [validate-yaml, security-scan, argocd-validate]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Identify changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v41
+        with:
+          files: |
+            environments/**/*.yaml
+            environments/**/*.yml
+
+      - name: Show deployment plan
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          echo "## 📋 Deployment Plan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The following files will be deployed upon merge:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
+            
+            # Extract environment from path
+            if [[ $file == environments/dev/* ]]; then
+              ENV="Development"
+            elif [[ $file == environments/local/* ]]; then
+              ENV="Local"
+            elif [[ $file == environments/prod/* ]]; then
+              ENV="Production ⚠️"
+            elif [[ $file == environments/stage/* ]]; then
+              ENV="Staging"
+            else
+              ENV="Unknown"
+            fi
+            
+            echo "  - Environment: **$ENV**" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Dry run completed successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const changedFiles = '${{ steps.changed-files.outputs.all_changed_files }}'.split(' ');
+            
+            let comment = '## 🚀 Deployment Preview\n\n';
+            comment += 'This PR will update the following ArgoCD applications:\n\n';
+            
+            changedFiles.forEach(file => {
+              let env = 'Unknown';
+              if (file.includes('environments/dev/')) env = '🔵 Development';
+              else if (file.includes('environments/local/')) env = '🟢 Local';
+              else if (file.includes('environments/prod/')) env = '🔴 Production';
+              else if (file.includes('environments/stage/')) env = '🟡 Staging';
+              
+              comment += `- \`${file}\` → ${env}\n`;
+            });
+            
+            comment += '\n**Note**: Changes will be automatically synced by ArgoCD after merge.\n';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # Job 5: Deploy to ArgoCD (Push to main only)
+  deploy-argocd:
+    name: Sync ArgoCD Applications
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [validate-yaml, security-scan, argocd-validate]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Identify changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v41
+        with:
+          files: |
+            environments/**/*.yaml
+            environments/**/*.yml
+
+      - name: Trigger ArgoCD sync
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          echo "🚀 Deployment triggered!"
+          echo "Changed files:"
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            echo "  - $file"
+          done
+          
+          # In a real scenario, you would sync with ArgoCD here:
+          # argocd app sync <app-name> --auth-token ${{ secrets.ARGOCD_TOKEN }}
+          
+          echo "✅ ArgoCD will automatically sync these changes"
+
+      - name: Send deployment notification
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          echo "📢 Deployment notification would be sent to:"
+          echo "  - Slack: #deployments"
+          echo "  - Email: ops-team@example.com"
+          echo ""
+          echo "Deployment Details:"
+          echo "  - Commit: ${{ github.sha }}"
+          echo "  - Author: ${{ github.actor }}"
+          echo "  - Branch: ${{ github.ref_name }}"
+
+  # Job 6: Generate deployment report
+  deployment-report:
+    name: Generate Deployment Report
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [deploy-argocd]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate report
+        run: |
+          echo "# 📊 Deployment Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Time**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Author**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Deployment completed successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create deployment record
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              description: 'ArgoCD GitOps deployment',
+              auto_merge: false,
+              required_contexts: []
+            });
+            
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              description: 'Deployment completed via ArgoCD'
+            });
